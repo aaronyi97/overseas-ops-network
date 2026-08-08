@@ -1,0 +1,64 @@
+#!/bin/sh /etc/rc.common
+# ============================================================================
+# init.d/sing-box — OpenWrt procd 服务脚本（MT3600BE 实测通过）
+#
+# 存放位置：路由器 /etc/init.d/sing-box（chmod +x）
+# 开机自启：/etc/init.d/sing-box enable
+#
+# 这个脚本管两件事：
+#   1. 用 procd 拉起并守护 sing-box（进程崩了自动重拉）
+#   2. 启动后下发 TPROXY 规则，停止前撤掉 TPROXY 规则
+#
+# 为什么规则脚本必须挂在这里（实测踩过的坑）：
+#   `ip rule` / `ip route` 是内核运行时状态，重启就丢。如果 init.d 只拉起
+#   sing-box 而不下发规则，重启后会出现"sing-box 在跑但全网不通"。
+#
+# 为什么不用 nohup / 自写后台守护（实测踩过的坑）：
+#   OpenWrt 的 BusyBox ash 没有 nohup。需要"延时自动拉起"这类操作时，
+#   写法是：在同一 SSH 会话里执行 `( sleep 120; /etc/init.d/sing-box start ) &`
+#   并保持该 SSH 窗口不关闭——不要用 nohup。
+# ============================================================================
+
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG="/usr/bin/sing-box"
+CONF="/etc/sing-box/config.json"
+RULES="/etc/sing-box-tproxy-rules.sh"
+
+start_service() {
+    # 启动前先校验配置，配置坏了宁可不起（不起 = fail-closed，不会裸奔）
+    "$PROG" check -c "$CONF" || {
+        echo "sing-box 配置校验失败，拒绝启动" >&2
+        return 1
+    }
+
+    procd_open_instance sing-box
+    procd_set_param command "$PROG" run -c "$CONF"
+
+    # 崩溃自动重启：间隔 5 秒，连续失败也继续尝试
+    procd_set_param respawn 3600 5 0
+
+    # 日志并入 syslog（用 logread -e sing-box 查看）
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+
+    procd_close_instance
+
+    # 关键：procd_close_instance 之后下发 TPROXY 规则
+    #（顺序不能反：先让 sing-box 起监听，再让规则把流量指过来）
+    if [ -x "$RULES" ]; then
+        sleep 3
+        "$RULES" start
+    else
+        echo "警告：$RULES 不存在，透明接管未生效" >&2
+    fi
+}
+
+stop_service() {
+    # 先撤规则，再由 procd 停进程。
+    # 撤掉规则后：若 fail-closed 防火墙已启用，外网保持全断；
+    # 若防火墙未启用（施工早期），设备回落到普通直连。
+    [ -x "$RULES" ] && "$RULES" stop
+}

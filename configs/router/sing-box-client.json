@@ -1,0 +1,155 @@
+// ============================================================================
+// sing-box 路由器客户端配置模板（GL.iNet MT3600BE / OpenWrt 21.02 实测通过）
+//
+// 使用说明：
+//   1. 本文件是"模板"，尖括号 <...> 是占位符，必须替换成你 01 阶段拿到的真实值
+//      （真实值只写进你本机 ~/overseas-ops/secrets.txt 和路由器上的配置，
+//       不要提交进 git、不要贴进会外发的对话）。
+//   2. sing-box 支持带注释的 JSON（extended JSON），注释可以直接保留。
+//      如果你用其他严格 JSON 工具编辑时报语法错，先把 // 注释删掉再校验。
+//   3. 改完必须在路由器上跑：sing-box check -c /etc/sing-box/config.json
+//      输出 rc:0 / CONFIG OK 才能继续。
+//
+// 这份配置干三件事：
+//   - TUN 虚拟网卡接管（auto_route 自动改路由表，strict_route 兜底防裸奔）
+//   - TPROXY 透明代理接管（IPv4 :60080 / IPv6 :60081，配合 tproxy-rules.sh）
+//   - 显式代理锚点（192.168.8.1:2080，施工验证和应急回退用）
+// 所有流量经 VLESS + Reality 加密隧道发往你自己的 VPS。
+// ============================================================================
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+
+  "inbounds": [
+    // ------------------------------------------------------------------
+    // 入口 1：显式代理锚点（mixed = HTTP + SOCKS5 都认）
+    // 用途：2.4 步先用它验证隧道通不通（电脑手动设代理指向它），
+    //       以后透明接管出问题时也可以临时改回显式代理应急。
+    // 只监听路由器 LAN 口地址，外面访问不到。
+    // ------------------------------------------------------------------
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "192.168.8.1",
+      "listen_port": 2080,
+      "sniff": true
+    },
+
+    // ------------------------------------------------------------------
+    // 入口 2：TUN 虚拟网卡（fail-closed 第一层在这里）
+    //   auto_route:        自动改路由表，把流量引进 tun0
+    //   auto_redirect:     配合 TPROXY 自动避开已被 TPROXY 接管的流量
+    //   strict_route:      隧道断了也禁止流量从普通路由溜走（关键！）
+    //   exclude_mptcp:     false = 不排除 Apple 设备的 MPTCP 流量，
+    //                      避免 iPhone 用 MPTCP 绕开隧道
+    //   iproute2_*:        避开 GL 固件自带的策略路由索引冲突（实测踩过坑，
+    //                      不要乱改这两个数字）
+    //   route_exclude_address: 这些私网网段不进隧道、走直连——
+    //                      保证你还能访问 192.168.8.1 管理面和上游网关。
+    //                      注意：被排除的网段流量不加密，所以 DNS 不能
+    //                      直接指向上游 ISP（会被污染），DNS 方案见
+    //                      configs/router/dnscrypt-dnsmasq.md
+    // ------------------------------------------------------------------
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "auto_route": true,
+      "auto_redirect": true,
+      "strict_route": true,
+      "exclude_mptcp": false,
+      "iproute2_table_index": 2022,
+      "iproute2_rule_index": 12000,
+      "route_exclude_address": [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10"
+      ],
+      "sniff": true
+    },
+
+    // ------------------------------------------------------------------
+    // 入口 3：TPROXY 透明代理（IPv4）
+    // 配合 tproxy-rules.sh 的 iptables 规则工作：局域网设备的 TCP/UDP
+    // 流量在 PREROUTING 被打上 fwmark 0x1，转发到这里。
+    //   sniff + sniff_override_destination: 嗅探 TLS 握手里的 SNI 域名，
+    //                      用真实域名覆盖目标地址。这是修 GFW DNS 污染的
+    //                      关键开关——即使设备拿到被污染的错误 IP，也能被
+    //                      纠正回正确域名再进隧道。（实测踩坑：不加这两行，
+    //                      被污染域名的 HTTPS 全部握手失败）
+    // ------------------------------------------------------------------
+    {
+      "type": "tproxy",
+      "tag": "tproxy4-in",
+      "listen": "0.0.0.0",
+      "listen_port": 60080,
+      "sniff": true,
+      "sniff_override_destination": true
+    },
+
+    // 入口 4：TPROXY 透明代理（IPv6），与上面同理，端口 60081
+    {
+      "type": "tproxy",
+      "tag": "tproxy6-in",
+      "listen": "::",
+      "listen_port": 60081,
+      "sniff": true,
+      "sniff_override_destination": true
+    }
+  ],
+
+  "outbounds": [
+    // ------------------------------------------------------------------
+    // 主出站：VLESS + Reality 加密隧道 → 你的 VPS
+    // 以下 6 个占位符全部来自 01 阶段（VPS 搭建）的产物：
+    //   <SERVER_IP>          VPS 的 IP 地址
+    //   <SERVER_PORT>        VPS 上 sing-box 监听端口（通常是 443）
+    //   <UUID>               VLESS 用户 UUID
+    //   <REALITY_SNI>        Reality 伪装的域名（01 阶段选定，如某大站域名）
+    //   <REALITY_PUBLIC_KEY> Reality 公钥（VPS 端持有对应私钥）
+    //   <REALITY_SHORT_ID>   Reality short id
+    // ------------------------------------------------------------------
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "<SERVER_IP>",
+      "server_port": 443,
+      "uuid": "<UUID>",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "<REALITY_SNI>",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "<REALITY_PUBLIC_KEY>",
+          "short_id": "<REALITY_SHORT_ID>"
+        }
+      }
+    },
+
+    // 直连出站：只作为 fallback 存在，正常流量不会用到它
+    // （route.final 指向 proxy；strict_route + 防火墙保证它不会被误用）
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+
+  "route": {
+    // 默认：所有流量走隧道
+    "final": "proxy"
+  }
+}

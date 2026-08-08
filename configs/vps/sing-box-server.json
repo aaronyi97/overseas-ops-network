@@ -1,0 +1,118 @@
+// ============================================================
+// sing-box 服务端配置模板（放在 VPS 上，路径 /etc/sing-box/config.json）
+// ------------------------------------------------------------
+// 用法：
+//   1. 把所有 <...> 占位符替换成你自己的真实值
+//      （真实值只写进你本地的 secrets.txt，不要提交进任何 git 仓库，
+//        也不要贴给任何不可信的人/对话）
+//   2. 每次改完必须先跑：sing-box check -c /etc/sing-box/config.json
+//      校验通过后再：systemctl reload sing-box（平滑重载，不要 restart）
+//
+// 说明：sing-box 的配置解析器支持 // 注释，本文件不需要删注释即可使用。
+// ============================================================
+{
+  "log": {
+    // 排障期用 info 方便看问题；稳定运行后可改成 warn 减少日志量
+    "level": "info",
+    "timestamp": true
+  },
+
+  "experimental": {
+    // cache_file：把出口选择结果持久化到磁盘（/etc/sing-box/cache.db），
+    // 保证 sing-box 重启、VPS 整机重启之后出口不变。
+    // 换出口 IP 对运营账号是扣分项，所以要钉死。
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_selected": true
+    },
+    // Clash API：管理接口，只监听 127.0.0.1（本机回环），
+    // 只允许在 VPS 本机访问，绝不对公网开放。
+    // 用途示例（在 VPS 上执行）：
+    //   curl -s http://127.0.0.1:9090/proxies/exit-select   查看当前出口
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090"
+    }
+  },
+
+  "inbounds": [
+    {
+      // 隧道入口：VLESS + Reality。
+      // 对外它看起来就是一次访问 www.cloudflare.com 的普通 HTTPS 连接，
+      // 没有可识别的代理特征；没有正确密钥的人连上来会被转交给真实站点。
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "<UUID>", // 用 sing-box generate uuid 生成
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.cloudflare.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            // Reality 借用的真实网站：校验不过的连接会被转交给它。
+            // 客户端（路由器）一侧的 SNI/伪装域名必须和这里保持一致。
+            "server": "www.cloudflare.com",
+            "server_port": 443
+          },
+          // 用 sing-box generate reality-keypair 生成的一对密钥：
+          // 私钥只放在 VPS（这里），公钥将来填进路由器/客户端配置。
+          "private_key": "<REALITY_PRIVATE_KEY>",
+          // 用 openssl rand -hex 8 生成的一串十六进制字符
+          "short_id": ["<REALITY_SHORT_ID>"]
+        }
+      }
+    }
+  ],
+
+  "outbounds": [
+    {
+      // 出口选择器：所有业务流量的最终出口由它决定。
+      // 生产纪律：这里只放住宅代理，禁止出现 direct——
+      // 住宅代理挂了宁可断网，也不允许自动回落成 VPS 直出（裸奔）。
+      "type": "selector",
+      "tag": "exit-select",
+      "outbounds": ["residential-isp"],
+      "default": "residential-isp"
+    },
+    {
+      // 你购买的独享住宅 IP 出口（HTTP 代理协议）。
+      // 目标网站最终看到的就是这个住宅 IP，而不是 VPS 的机房 IP。
+      "type": "http",
+      "tag": "residential-isp",
+      "server": "<PROXY_HOST>",
+      "server_port": <PROXY_PORT>, // 注意：端口号是数字，不带引号
+      "username": "<PROXY_USER>",
+      "password": "<PROXY_PASS>"
+    },
+    {
+      // 仅排障用的直连出口（出口 = VPS 自己的机房 IP）。
+      // 它只允许在排障时临时加进上面的 exit-select，用完立刻移除并重载；
+      // 生产环境的 exit-select 里禁止出现它。
+      "type": "direct",
+      "tag": "direct-debug"
+    }
+  ],
+
+  "route": {
+    "rules": [
+      {
+        // 阻断 QUIC（UDP 443）：
+        // HTTP 协议的住宅代理只能转发 TCP，转不了 UDP。
+        // 把 QUIC 拒掉后，浏览器会自动回退到普通 HTTPS（TCP），
+        // 避免一部分流量走 UDP 漏出代理链路。
+        "network": "udp",
+        "port": 443,
+        "action": "reject"
+      }
+    ],
+    // 其余所有流量一律走出口选择器
+    "final": "exit-select"
+  }
+}
