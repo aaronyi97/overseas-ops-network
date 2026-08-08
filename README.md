@@ -1,3 +1,5 @@
+![用 AI 做内容、产品和小生意](docs/assets/x-header.png)
+
 # overseas-ops-network
 
 每月 100 元左右，搭一套属于自己的海外运营网络环境：**路由器层透明接管 + 自建加密隧道 + 独享固定住宅 IP + 双层 fail-closed**。
